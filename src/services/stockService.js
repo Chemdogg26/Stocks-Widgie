@@ -1,164 +1,181 @@
-import yahooFinance from 'yahoo-finance2';
+// Stock service that talks to Electron main via IPC (Alpha Vantage backend)
 
-// Cache for stock data to minimize API calls
 const cache = new Map();
-const CACHE_DURATION = 60000; // 1 minute cache
+const CACHE_DURATION = 60_000; // 1 minute
 
 function getCacheKey(symbol, timeframe) {
   return `${symbol}_${timeframe}`;
 }
 
-function isCacheValid(cacheEntry) {
-  return Date.now() - cacheEntry.timestamp < CACHE_DURATION;
+function isCacheValid(entry) {
+  return entry && Date.now() - entry.timestamp < CACHE_DURATION;
 }
 
-export async function getStockQuote(symbol) {
-  try {
-    if (!symbol || typeof symbol !== 'string' || symbol.trim().length === 0) {
-      throw new Error('Invalid symbol provided');
+// Map our timeframes to an approximate number of days
+function timeframeToDays(timeframe) {
+  switch (timeframe) {
+    case '1d':
+      return 1;
+    case '5d':
+      return 5;
+    case '1mo':
+      return 30;
+    case '6mo':
+      return 180;
+    case 'ytd': {
+      const startOfYear = new Date(new Date().getFullYear(), 0, 1);
+      const diff = (Date.now() - startOfYear.getTime()) / (1000 * 60 * 60 * 24);
+      return Math.max(1, Math.round(diff));
     }
-
-    const cacheKey = getCacheKey(symbol.trim().toUpperCase(), 'quote');
-    const cached = cache.get(cacheKey);
-    
-    if (cached && isCacheValid(cached)) {
-      return cached.data;
-    }
-
-    const quote = await yahooFinance.quote(symbol.trim().toUpperCase());
-    
-    if (!quote || !quote.symbol) {
-      throw new Error(`Invalid symbol: ${symbol} not found`);
-    }
-    
-    const data = {
-      symbol: quote.symbol,
-      shortName: quote.shortName || quote.longName || symbol,
-      regularMarketPrice: quote.regularMarketPrice,
-      regularMarketPreviousClose: quote.regularMarketPreviousClose,
-      regularMarketChange: quote.regularMarketChange,
-      regularMarketChangePercent: quote.regularMarketChangePercent,
-      regularMarketOpen: quote.regularMarketOpen,
-      regularMarketDayHigh: quote.regularMarketDayHigh,
-      regularMarketDayLow: quote.regularMarketDayLow,
-      marketCap: quote.marketCap,
-      trailingPE: quote.trailingPE,
-      dividendYield: quote.dividendYield,
-      trailingAnnualDividendRate: quote.trailingAnnualDividendRate,
-      fiftyTwoWeekHigh: quote.fiftyTwoWeekHigh,
-      fiftyTwoWeekLow: quote.fiftyTwoWeekLow,
-      regularMarketTime: quote.regularMarketTime,
-      marketState: quote.marketState
-    };
-
-    cache.set(cacheKey, { data, timestamp: Date.now() });
-    return data;
-  } catch (error) {
-    console.error(`Error fetching quote for ${symbol}:`, error);
-    
-    // Provide more specific error messages
-    if (error.message.includes('not found') || error.message.includes('Invalid symbol')) {
-      throw new Error(`Invalid symbol: ${symbol} not found`);
-    }
-    if (error.code === 'ENOTFOUND' || error.code === 'ECONNREFUSED') {
-      throw new Error('Network error: Unable to connect to stock data service');
-    }
-    
-    throw new Error(`Failed to fetch stock data for ${symbol}: ${error.message}`);
+    case '1y':
+      return 365;
+    case '5y':
+      return 365 * 5;
+    case 'max':
+      return Infinity;
+    default:
+      return 30;
   }
 }
 
-export async function getHistoricalData(symbol, timeframe = '1d') {
+export async function getStockQuote(symbolRaw) {
+  const symbol = symbolRaw?.trim()?.toUpperCase();
+  if (!symbol) {
+    throw new Error('Invalid symbol provided');
+  }
+
+  if (!window.electronAPI || !window.electronAPI.fetchStockQuote) {
+    throw new Error('IPC not available for stock quote');
+  }
+
+  const cacheKey = getCacheKey(symbol, 'quote');
+  const cached = cache.get(cacheKey);
+  if (isCacheValid(cached)) return cached.data;
+
+  let json;
   try {
-    if (!symbol || typeof symbol !== 'string' || symbol.trim().length === 0) {
-      throw new Error('Invalid symbol provided');
+    json = await window.electronAPI.fetchStockQuote(symbol);
+  } catch (err) {
+    console.error('Error fetching quote via IPC', err);
+    const msg = err?.message || String(err);
+    if (msg.includes('Network error')) {
+      throw new Error('Network error: Unable to connect to stock data service');
     }
+    throw new Error(msg);
+  }
 
-    const cacheKey = getCacheKey(symbol.trim().toUpperCase(), timeframe);
-    const cached = cache.get(cacheKey);
-    
-    if (cached && isCacheValid(cached)) {
-      return cached.data;
+  // Alpha Vantage may return a Note or Error Message instead of data
+  const note = json?.Note || json?.['Error Message'];
+  if (note) {
+    if (note.toLowerCase().includes('call frequency')) {
+      throw new Error('API limit reached. Please wait a minute and try again.');
     }
+    throw new Error(note);
+  }
 
-    const now = new Date();
-    let startDate = new Date();
-    let interval = '1m';
+  const q = json?.['Global Quote'];
+  if (!q || Object.keys(q).length === 0) {
+    throw new Error(`Stock symbol "${symbol}" not found. Please check the symbol and try again.`);
+  }
 
-    // Determine date range and interval based on timeframe
-    switch (timeframe) {
-      case '1d':
-        startDate.setDate(now.getDate() - 1);
-        interval = '1m';
-        break;
-      case '5d':
-        startDate.setDate(now.getDate() - 5);
-        interval = '5m';
-        break;
-      case '1mo':
-        startDate.setMonth(now.getMonth() - 1);
-        interval = '1h';
-        break;
-      case '6mo':
-        startDate.setMonth(now.getMonth() - 6);
-        interval = '1d';
-        break;
-      case 'ytd':
-        startDate = new Date(now.getFullYear(), 0, 1);
-        interval = '1d';
-        break;
-      case '1y':
-        startDate.setFullYear(now.getFullYear() - 1);
-        interval = '1d';
-        break;
-      case '5y':
-        startDate.setFullYear(now.getFullYear() - 5);
-        interval = '1wk';
-        break;
-      case 'max':
-        startDate = new Date(2000, 0, 1);
-        interval = '1mo';
-        break;
-      default:
-        startDate.setDate(now.getDate() - 1);
-        interval = '1m';
-    }
+  const price = parseFloat(q['05. price']);
+  const prevClose = parseFloat(q['08. previous close']);
+  const change = parseFloat(q['09. change']);
+  const changePercentStr = q['10. change percent'] || '';
+  const changePercent = parseFloat(changePercentStr.replace('%', ''));
 
-    const historical = await yahooFinance.historical(symbol.trim().toUpperCase(), {
-      period1: startDate,
-      period2: now,
-      interval: interval
+  const data = {
+    symbol,
+    shortName: symbol, // Alpha Vantage doesn't provide company name on this endpoint
+    regularMarketPrice: isNaN(price) ? null : price,
+    regularMarketPreviousClose: isNaN(prevClose) ? null : prevClose,
+    regularMarketChange: isNaN(change) ? null : change,
+    regularMarketChangePercent: isNaN(changePercent) ? null : changePercent,
+    regularMarketOpen: parseFloat(q['02. open']) || null,
+    regularMarketDayHigh: parseFloat(q['03. high']) || null,
+    regularMarketDayLow: parseFloat(q['04. low']) || null,
+    marketCap: null, // not available from this endpoint
+    trailingPE: null,
+    dividendYield: null,
+    trailingAnnualDividendRate: null,
+    fiftyTwoWeekHigh: null,
+    fiftyTwoWeekLow: null,
+    regularMarketTime: null,
+    marketState: 'REGULAR'
+  };
+
+  cache.set(cacheKey, { data, timestamp: Date.now() });
+  return data;
+}
+
+export async function getHistoricalData(symbolRaw, timeframe = '1d') {
+  const symbol = symbolRaw?.trim()?.toUpperCase();
+  if (!symbol) {
+    throw new Error('Invalid symbol provided');
+  }
+
+  if (!window.electronAPI || !window.electronAPI.fetchStockHistory) {
+    throw new Error('IPC not available for stock history');
+  }
+
+  const cacheKey = getCacheKey(symbol, timeframe);
+  const cached = cache.get(cacheKey);
+  if (isCacheValid(cached)) return cached.data;
+
+  let json;
+  try {
+    // We ignore range/interval on the main side; we down-sample here
+    json = await window.electronAPI.fetchStockHistory({
+      symbol,
+      range: timeframe,
+      interval: '1d'
     });
-
-    if (!historical || historical.length === 0) {
-      throw new Error(`No historical data available for ${symbol}`);
-    }
-
-    const data = historical.map(item => ({
-      date: new Date(item.date),
-      price: item.close || item.adjClose,
-      volume: item.volume
-    })).filter(item => item.price != null);
-
-    if (data.length === 0) {
-      throw new Error(`No valid price data available for ${symbol}`);
-    }
-
-    cache.set(cacheKey, { data, timestamp: Date.now() });
-    return data;
-  } catch (error) {
-    console.error(`Error fetching historical data for ${symbol}:`, error);
-    
-    // Provide more specific error messages
-    if (error.message.includes('not found') || error.message.includes('Invalid symbol')) {
-      throw new Error(`Invalid symbol: ${symbol} not found`);
-    }
-    if (error.code === 'ENOTFOUND' || error.code === 'ECONNREFUSED') {
+  } catch (err) {
+    console.error('Error fetching history via IPC', err);
+    const msg = err?.message || String(err);
+    if (msg.includes('Network error')) {
       throw new Error('Network error: Unable to connect to stock data service');
     }
-    
-    throw new Error(`Failed to fetch historical data for ${symbol}: ${error.message}`);
+    throw new Error(msg);
   }
+
+  const series = json?.['Time Series (Daily)'];
+  if (!series) {
+    const note = json?.Note || json?.['Error Message'];
+    if (note && note.includes('call frequency')) {
+      throw new Error('API limit reached. Please wait a minute and try again.');
+    }
+    throw new Error(`No historical data available for ${symbol}`);
+  }
+
+  // Alpha Vantage returns an object keyed by date string; sort by date
+  const daysLimit = timeframeToDays(timeframe);
+  const entries = Object.entries(series)
+    .map(([dateStr, values]) => ({
+      date: new Date(dateStr),
+      price: parseFloat(values['4. close']),
+      volume: parseInt(values['6. volume'], 10) || null
+    }))
+    .filter((d) => !isNaN(d.price))
+    .sort((a, b) => a.date - b.date);
+
+  let data = entries;
+  if (Number.isFinite(daysLimit)) {
+    const cutoff = new Date();
+    cutoff.setDate(cutoff.getDate() - daysLimit);
+    data = entries.filter((d) => d.date >= cutoff);
+  }
+
+  if (data.length === 0) {
+    throw new Error(`No valid price data available for ${symbol}`);
+  }
+
+  cache.set(cacheKey, { data, timestamp: Date.now() });
+  return data;
+}
+
+export function clearCache() {
+  cache.clear();
 }
 
 export function clearCache() {
